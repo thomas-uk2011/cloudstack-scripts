@@ -1,0 +1,85 @@
+[root@ipmon02.bt-cc delete_orphaned_snaps]# cat create_script.sh
+#!/bin/bash
+## Script written by thomas.joseph@opsoft.com on 10th March 2030
+## To delete snaps that were not deleted by the cloud application server, even though they are in expunged state in the cloud DB.
+## Only checks for deleted snaps over 2 days old.
+## Variable declaration
+
+MYSQL='mysql -h 10.16.30.12 -u root -pP3arjuice -s cloud  -Be'
+MYSQLN='mysql -h 10.16.30.12 -u root -pP3arjuice -s cloud  -NBe'
+PAWD=/opt/automations/delete_orphaned_snaps
+# Obtain or propmt for Datacenter ID, if not provided during runtime
+if [[ -z $1 ]] ; then
+echo -e "Please enter the DC ID during runtime"
+echo -e "                       1   CO-BOG-NIM-G-V-A-R-S-001
+                        3   US-NEW-NUT-G-V-A-R-S-001
+                        7   BR-SAO-HOR-G-V-A-R-S-001
+                        8   US-NEW-NUT-P-V-A-R-S-001
+                        11  GB-CRO-BN-G-V-A-R-S-001
+                        12  SG-SIN-KB-G-V-A-R-S-001
+                        16  HK-HON-WH-G-V-A-R-S-001
+                        19  IT-MIL-MN-G-V-A-R-S-001
+                        21  FR-PAR-PS-G-V-A-R-S-001
+                        25  GB-LON-GH-G-V-A-R-S-001
+                        26  DE-FRT-FT-G-V-A-R-S-001
+                        30  GB-CRO-BN-P-V-A-R-S-004
+                        31  CN-SHA-SH-G-V-A-R-S-001
+                        44  ZA-JNB-JB-G-V-A-R-S-001
+                        53  GB-CRO-BN-G-V-A-R-S-002
+                        66  CN-SHA-SH-P-V-A-R-S-001
+                        67  SG-SIN-CC-P-V-A-R-S-001
+
+                        Enter the Zone id (e.g. 44 for South Africa): \c"
+                                read DC_ID
+                        else
+                                        DC_ID=$1
+                                fi
+# To get the SSVM ID from cloud db depending on the datacenter id selected.
+SSVM_ID=`$MYSQLN "select name  from vm_instance where name like 's-%-VM' and removed is null and data_center_id=${DC_ID} and vm_type='SecondaryStorageVm' and type='SecondaryStorageVm' limit 1"`
+# To get the secondary storage ID from the cloud db and insert a "," to be used in DB select statement
+SSTGE_ID=`$MYSQLN "select id from image_store where data_center_id=${DC_ID} and removed is null" | tr -s '[\n]'  ',' | sed 's/,$//'`
+
+# Obtain the list of current snaps over 2 days old from the cloud db
+$MYSQLN "select im.parent,install_path from snapshot_store_ref ssr, image_store im where snapshot_id in (select id from snapshots where  data_center_id=${DC_ID}) and store_id in (${SSTGE_ID}) and store_role='Image' and ssr.state='Ready' and im.id=store_id and ssr.created < DATE_SUB(NOW() , INTERVAL 2 DAY)" > ${PAWD}/db_list_${DC_ID}
+
+# transfer list to SSVM
+/bin/rscp ${PAWD}/db_list_${DC_ID} ${SSVM_ID}:/mnt/SecStorage/
+
+# create a script to be run on ssvm
+cat  << EOF > ${PAWD}/run_on_ssvm.sh
+#!/bin/bash
+DATE=`date +'%F_%H_%M'`
+cd /mnt/SecStorage
+# find all the vmdk files present on all the stores
+find */snapshots/ -name "*disk0.vmdk" -mtime +2 > /mnt/SecStorage/present
+# compare it with current list obtained from cloud DB, and if not present in db, add to delete list.
+for i in \$(awk -F/ '{print \$(NF-1)}' /mnt/SecStorage/present) ; do  grep  -q \$i /mnt/SecStorage/db_list_${DC_ID} ; if [ \$? = 1 ] ; then grep \$i /mnt/SecStorage/present >> /mnt/SecStorage/to_be_deleted ; fi ; done
+# if any vmdk files need to be deleted and file is not empty, list the snaps and delete it.
+if  [ ! -s /mnt/SecStorage/to_be_deleted ]
+then
+        echo " No orphaned snaps found"
+        exit 0
+else
+# for future ref: list of deleted snaps is present in the 'ouput' file
+echo "Date the following snaps were deleted on : \$DATE" >> /mnt/SecStorage/output
+echo "Creation date" >> /mnt/SecStorage/output
+for i  in \$(cat to_be_deleted) ; do ls -lh  \$i >> /mnt/SecStorage/output ; done
+echo "Size of the vmdk file" >> /mnt/SecStorage/output
+for i  in \$(cat to_be_deleted) ; do du -sh \$i >> /mnt/SecStorage/output ; done
+awk -F/ '{print "rm -rf "\$1"/"\$2"/"\$3"/"\$4"/"\$5}' to_be_deleted  > /mnt/SecStorage/to_be_deleted1
+cat /mnt/SecStorage/output
+sh to_be_deleted1
+# delete temporary files
+rm /mnt/SecStorage/to_be_deleted1 /mnt/SecStorage/to_be_deleted
+fi
+# delete temporary files
+rm /mnt/SecStorage/present /mnt/SecStorage/db_list_${DC_ID}
+EOF
+## end of script
+# make script executable and transfer it to ssvm
+chmod a+x ${PAWD}/run_on_ssvm.sh
+/bin/rscp ${PAWD}/run_on_ssvm.sh ${SSVM_ID}:/mnt/SecStorage/
+# run script on ssvm
+/bin/rssh ${SSVM_ID} /mnt/SecStorage/run_on_ssvm.sh
+# delete temporary files
+rm ${PAWD}/run_on_ssvm.sh  ${PAWD}/db_list_${DC_ID}
